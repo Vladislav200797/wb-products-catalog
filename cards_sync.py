@@ -1,6 +1,16 @@
 # cards_sync.py
-# Полный перечень товаров из WB Content API: размеры, баркоды (skus), артикулы продавца.
-# Пишем в Supabase таблицу wb_products_catalog (upsert).
+# Выгрузка полного перечня карточек WB (с размерами, баркодами, артикулами продавца)
+# Content API v2: POST /content/v2/get/cards/list (курсорная пагинация)
+#
+# Требуемые ENV:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE
+#   WB_API_KEY                  # ключ категории Content (или Promotion) из ЛК WB
+# Опциональные ENV:
+#   CURSOR_LIMIT=100            # лимит на страницу (1..100)
+#   LOCALE=ru                   # ru|en|zh для полей name/value/object
+#   SLEEP_BETWEEN_REQ_MS=700    # пауза между запросами (мс), чтобы не упираться в лимиты
+#   BATCH_SIZE=1000             # размер батча апсерта в Supabase
 
 import os
 import time
@@ -11,27 +21,27 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE"]
-WB_API_KEY   = os.environ["WB_API_KEY"]
+WB_API_KEY   = os.environ["WB_API_KEY"]  # см. комментарий выше
 
-# Endpoints
-CONTENT_V2 = "https://content-api.wildberries.ru/content/v2/get/cards/list"
-CONTENT_V1_CURSOR = "https://content-api.wildberries.ru/content/v1/cards/cursor/list"
+CONTENT_V2_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
 
+CURSOR_LIMIT = max(1, min(int(os.environ.get("CURSOR_LIMIT", "100")), 100))
+LOCALE = os.environ.get("LOCALE", None)  # None -> не добавлять параметр
+SLEEP_BETWEEN_REQ_MS = int(os.environ.get("SLEEP_BETWEEN_REQ_MS", "700"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1000"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
 def _auth_headers() -> Dict[str, str]:
     return {"Authorization": WB_API_KEY, "Content-Type": "application/json"}
 
-def _retryable_request(method: str, url: str, **kwargs) -> requests.Response:
+def _retryable_post(url: str, json: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    # Ретраим 429/5xx с бэкофом
     last_err: Optional[Exception] = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, 5):
         try:
-            resp = requests.request(method, url, timeout=120, **kwargs)
-            # На 429/5xx — ретрай с бэкофом
+            resp = requests.post(url, headers=_auth_headers(), json=json, params=params, timeout=120)
             if resp.status_code in (429, 500, 502, 503, 504):
                 delay = min(30, 2 ** attempt)
-                print(f"{method} {url} -> {resp.status_code}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+                print(f"POST {url} -> {resp.status_code}, retry in {delay}s (attempt {attempt}/4)")
                 time.sleep(delay)
                 continue
             resp.raise_for_status()
@@ -39,11 +49,11 @@ def _retryable_request(method: str, url: str, **kwargs) -> requests.Response:
         except Exception as e:
             last_err = e
             delay = min(30, 2 ** attempt)
-            print(f"{method} {url} error: {e!r}, retry in {delay}s (attempt {attempt}/{MAX_RETRIES})")
+            print(f"POST {url} error: {e!r}, retry in {delay}s (attempt {attempt}/4)")
             time.sleep(delay)
-    raise SystemExit(f"HTTP failed after retries: {method} {url} last_err={last_err!r}")
+    raise RuntimeError(f"HTTP failed after retries: POST {url} last_err={last_err!r}")
 
-def _flatten_v2_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _flatten_cards(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for it in items:
         nm_id = it.get("nmID") or it.get("nmId")
@@ -57,7 +67,6 @@ def _flatten_v2_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             tech_size = s.get("techSize") or s.get("techSizeName")
             size_id = s.get("sizeID") or s.get("sizeId")
             skus = s.get("skus") or []
-            # В некоторых ответах skus — массив строк (баркоды)
             for bc in skus:
                 if not bc:
                     continue
@@ -74,73 +83,69 @@ def _flatten_v2_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 })
     return rows
 
-def _flatten_v1_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # v1 структура очень близка: nmID, imtID, vendorCode, sizes[].skus[]
-    return _flatten_v2_items(items)
-
 def fetch_all_cards_v2() -> List[Dict[str, Any]]:
     """
-    Пагинация v2: limit/offset. Некоторые аккаунты используют курсор; в базе доков встречаются обе модели.
-    В большинстве случаев работает limit/offset. Идём до пустого ответа.
+    Курсорная пагинация (как в доке):
+    1) Первый запрос: settings.cursor.limit=CURSOR_LIMIT, filter.withPhoto=-1 (все)
+    2) На каждой странице берём cursor.updatedAt и cursor.nmID -> в следующий запрос
+    3) Идём пока cursor.total >= limit (или пока приходят карточки)
     """
-    all_rows: List[Dict[str, Any]] = []
-    offset = 0
-    limit = 1000  # максимально возможное
-    while True:
-        payload = {
-            # фильтр пустой = «все карточки»
-            "filter": {},
-            # блок настроек пагинации (варианты назв.: "settings" или "page" у разных ревизий API)
-            "settings": {"limit": limit, "offset": offset}
-        }
-        resp = _retryable_request("POST", CONTENT_V2, headers=_auth_headers(), json=payload)
-        js = resp.json()
-        # ожидаем список карточек в "data" или сразу массив (разные ревизии)
-        items = js.get("data") if isinstance(js, dict) else js
-        if not items:
-            break
-        flat = _flatten_v2_items(items)
-        all_rows.extend(flat)
-        print(f"v2 page: items={len(items)}, flat={len(flat)}, total_flat={len(all_rows)}, offset={offset}")
-        offset += limit
-        # предохранитель от бесконечного цикла
-        if len(items) < limit:
-            break
-    return all_rows
+    all_flat: List[Dict[str, Any]] = []
 
-def fetch_all_cards_v1_cursor() -> List[Dict[str, Any]]:
-    """
-    Классическая пагинация курсором: updatedAt + nmID.
-    Берём "очень раннюю" точку и листаем до конца.
-    """
-    all_rows: List[Dict[str, Any]] = []
-    cursor_updated = "1970-01-01T00:00:00Z"
-    cursor_nm = 0
-    limit = 1000
+    cursor_updated: Optional[str] = None
+    cursor_nm: Optional[int] = None
+
+    page = 0
     while True:
+        page += 1
+        cursor_obj: Dict[str, Any] = {"limit": CURSOR_LIMIT}
+        if cursor_updated is not None and cursor_nm is not None:
+            cursor_obj["updatedAt"] = cursor_updated
+            cursor_obj["nmID"] = cursor_nm
+
         payload = {
-            "sort": {
-                "cursor": {"limit": limit, "updatedAt": cursor_updated, "nmID": cursor_nm},
-                "sortBy": "updateAt"
-            },
-            "filter": {}  # без фильтров = «все карточки»
+            "settings": {
+                "cursor": cursor_obj,
+                "filter": {
+                    "withPhoto": -1  # -1 — без фильтра по фото (все)
+                }
+            }
         }
-        resp = _retryable_request("POST", CONTENT_V1_CURSOR, headers=_auth_headers(), json=payload)
+
+        params = {"locale": LOCALE} if LOCALE else None
+        resp = _retryable_post(CONTENT_V2_URL, json=payload, params=params)
         js = resp.json()
-        items = js.get("data") if isinstance(js, dict) else js
-        if not items:
+
+        cards = js.get("cards") or js.get("data") or []
+        cursor = js.get("cursor") or {}
+
+        total = cursor.get("total")
+        updatedAt_next = cursor.get("updatedAt")
+        nmID_next = cursor.get("nmID")
+
+        # Расплющиваем
+        flat = _flatten_cards(cards)
+        all_flat.extend(flat)
+
+        print(f"page {page}: cards={len(cards)}, flat={len(flat)}, total_flat={len(all_flat)}, "
+              f"cursor.total={total}, next=({updatedAt_next},{nmID_next})")
+
+        # Готовим курсор на следующую страницу
+        cursor_updated = updatedAt_next
+        cursor_nm = nmID_next
+
+        # Условия выхода:
+        # - если на странице нет карточек -> конец
+        # - если cursor.total < limit -> конец (дока WB)
+        if not cards:
             break
-        flat = _flatten_v1_items(items)
-        all_rows.extend(flat)
-        print(f"v1 page: items={len(items)}, flat={len(flat)}, total_flat={len(all_rows)}, "
-              f"cursor=({cursor_updated},{cursor_nm})")
-        # обновляем курсор на последний элемент страницы
-        last = items[-1]
-        cursor_updated = last.get("updatedAt") or cursor_updated
-        cursor_nm = last.get("nmID") or last.get("nmId") or cursor_nm
-        if len(items) < limit:
+        if isinstance(total, int) and total < CURSOR_LIMIT:
             break
-    return all_rows
+
+        # щадим лимиты: 100 req/min -> ~1 req/0.6s
+        time.sleep(SLEEP_BETWEEN_REQ_MS / 1000.0)
+
+    return all_flat
 
 def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
     buf: List[Any] = []
@@ -159,29 +164,18 @@ def upsert_catalog(sb: Client, rows: List[Dict[str, Any]]) -> None:
         return
     sent = 0
     for batch in chunked(rows, BATCH_SIZE):
-        res = sb.table("wb_products_catalog") \
-                .upsert(batch, on_conflict="nm_id,barcode") \
-                .execute()
+        res = sb.table("wb_products_catalog").upsert(
+            batch, on_conflict="nm_id,barcode"
+        ).execute()
         if getattr(res, "error", None):
             msg = getattr(res.error, "message", str(res.error))
-            raise SystemExit(f"Upsert error: {msg}")
+            raise RuntimeError(f"Upsert error: {msg}")
         affected = len(res.data) if res.data is not None else 0
         sent += len(batch)
         print(f"Upserted {len(batch)} (affected≈{affected}), progress {sent}/{total}")
 
 def main():
-    # 1) пробуем v2
-    try:
-        print("Trying Content API v2…")
-        rows = fetch_all_cards_v2()
-        if not rows:
-            print("v2 returned 0 rows, falling back to v1 cursor…")
-            rows = fetch_all_cards_v1_cursor()
-    except Exception as e:
-        print(f"v2 failed: {e!r}. Falling back to v1 cursor…")
-        rows = fetch_all_cards_v1_cursor()
-
-    # чистим мусорные строки без ключевых полей
+    rows = fetch_all_cards_v2()
     cleaned = [r for r in rows if r.get("nm_id") and r.get("barcode")]
     dropped = len(rows) - len(cleaned)
     if dropped:
