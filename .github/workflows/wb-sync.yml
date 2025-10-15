@@ -1,0 +1,46 @@
+name: WB Stocks + Catalog Sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # остатки каждые 30 минут
+    - cron: "15 3 * * *"     # каталог 1 раз в день в 03:15 UTC (~06:15 по МСК)
+  workflow_dispatch: {}       # можно запустить вручную из GitHub UI
+
+jobs:
+  sync_stocks:
+    if: github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Sync stocks (остатки)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          WB_API_KEY: ${{ secrets.WB_API_KEY }}
+        run: python stocks_sync.py
+
+  sync_catalog:
+    if: github.event.schedule == '15 3 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Sync product catalog (карточки)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          WB_API_KEY: ${{ secrets.WB_API_KEY }}
+          BATCH_SIZE: "1000"
+          MAX_RETRIES: "3"
+        run: python cards_sync.py
